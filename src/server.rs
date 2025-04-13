@@ -1,21 +1,22 @@
-use std::sync::Arc;
-use anyhow::{Context, Result};
-use futures::StreamExt;
-use log::{debug, error, info};
-use serde_json::{json, Value};
-use tokio::runtime::Runtime;
-use tokio::signal::ctrl_c;
-use uuid::Uuid;
+// src/server.rs
 
-use crate::task_manager::TaskManager;
-use crate::transport::Transport;
-use crate::types::{
-    JsonRpcError, JsonRpcRequest, JsonRpcResponse, Message, PushNotificationConfig, TaskState,
-};
+use std::sync::Arc;
+use anyhow::Result;
+use log::{error, info};
+use serde_json::json;
+use tokio::runtime::Runtime;
+use tokio::signal;
+use tokio::sync::oneshot;
+use uuid::Uuid;
+use futures::StreamExt;
+
+use crate::task_manager_trait::TaskManagerTrait;
+use crate::transport::{Transport, create_handler};
+use crate::types::{JsonRpcRequest, create_response, create_error_response};
 
 /// Server for handling A2A requests
 pub struct Server {
-    task_manager: Arc<TaskManager>,
+    task_manager: Arc<dyn TaskManagerTrait>,
     transport: Arc<dyn Transport>,
     runtime: Runtime,
 }
@@ -23,7 +24,7 @@ pub struct Server {
 impl Server {
     /// Create a new Server instance
     pub(crate) fn new(
-        task_manager: Arc<TaskManager>,
+        task_manager: Arc<dyn TaskManagerTrait>,
         transport: Arc<dyn Transport>,
         runtime: Runtime,
     ) -> Self {
@@ -33,754 +34,393 @@ impl Server {
             runtime,
         }
     }
-
-    /// Handle a JSON-RPC request
-    pub async fn handle_request(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
-        debug!("Handling request: {:?}", request);
-        
-        match request.method.as_str() {
-            "agents/getInfo" => self.handle_get_info(request).await,
-            "tasks/create" => self.handle_create_task(request).await,
-            "tasks/get" => self.handle_get_task(request).await,
-            "tasks/send" => self.handle_send_task(request).await,
-            "tasks/sendSubscribe" => self.handle_send_subscribe_task(request).await,
-            "tasks/cancel" => self.handle_cancel_task(request).await,
-            _ => Ok(JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id: request.id,
-                result: None,
-                error: Some(JsonRpcError {
-                    code: -32601,
-                    message: "Method not found".to_string(),
-                    data: None,
-                }),
-            }),
-        }
-    }
     
-    /// Handle agents/getInfo request
-    async fn handle_get_info(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
-        // Return the agent information
-        Ok(JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            id: request.id,
-            result: Some(json!({
-                "agent": self.task_manager.agent(),
-            })),
-            error: None,
-        })
-    }
-    
-    /// Handle tasks/create request
-    async fn handle_create_task(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
-        // Extract parameters
-        let params = request.params;
+    /// Run the server until shutdown signal is received
+    pub fn run_until_shutdown(self) -> Result<()> {
+        let (_tx, rx) = oneshot::channel::<()>();
         
-        // Extract messages
-        let messages = match params.get("messages") {
-            Some(Value::Array(messages)) => {
-                let mut result = Vec::new();
-                for message in messages {
-                    let message: Message = serde_json::from_value(message.clone())
-                        .context("Invalid message format")?;
-                    result.push(message);
-                }
-                result
-            }
-            _ => {
-                return Ok(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: request.id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32602,
-                        message: "Invalid params: messages is required and must be an array".to_string(),
-                        data: None,
-                    }),
-                });
-            }
-        };
-        
-        // Extract push notification config (optional)
-        let push_notification_config = match params.get("pushNotificationConfig") {
-            Some(config) => {
-                let config: PushNotificationConfig = serde_json::from_value(config.clone())
-                    .context("Invalid pushNotificationConfig format")?;
-                Some(config)
-            }
-            None => None,
-        };
-        
-        // Create the task
-        let task = self.task_manager
-            .create_task(messages, push_notification_config)
-            .await
-            .context("Failed to create task")?;
-        
-        // Return the task
-        Ok(JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            id: request.id,
-            result: Some(json!({
-                "task": task,
-            })),
-            error: None,
-        })
-    }
-    
-    /// Handle tasks/get request
-    async fn handle_get_task(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
-        // Extract parameters
-        let params = request.params;
-        
-        // Extract task ID
-        let task_id = match params.get("taskId") {
-            Some(Value::String(id_str)) => {
-                Uuid::parse_str(id_str).context("Invalid task ID format")?
-            }
-            _ => {
-                return Ok(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: request.id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32602,
-                        message: "Invalid params: taskId is required and must be a string".to_string(),
-                        data: None,
-                    }),
-                });
-            }
-        };
-        
-        // Get the task
-        let task = match self.task_manager.get_task(task_id).await? {
-            Some(task) => task,
-            None => {
-                return Ok(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: request.id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: 404,
-                        message: "Task not found".to_string(),
-                        data: None,
-                    }),
-                });
-            }
-        };
-        
-        // Return the task
-        Ok(JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            id: request.id,
-            result: Some(json!({
-                "task": task,
-            })),
-            error: None,
-        })
-    }
-    
-    /// Handle tasks/send request
-    async fn handle_send_task(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
-        // Extract parameters
-        let params = request.params;
-        
-        // Extract task ID
-        let task_id = match params.get("taskId") {
-            Some(Value::String(id_str)) => {
-                Uuid::parse_str(id_str).context("Invalid task ID format")?
-            }
-            _ => {
-                return Ok(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: request.id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32602,
-                        message: "Invalid params: taskId is required and must be a string".to_string(),
-                        data: None,
-                    }),
-                });
-            }
-        };
-        
-        // Check if task exists
-        let task = match self.task_manager.get_task(task_id).await? {
-            Some(task) => task,
-            None => {
-                return Ok(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: request.id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: 404,
-                        message: "Task not found".to_string(),
-                        data: None,
-                    }),
-                });
-            }
-        };
-        
-        // Check if task is in the right state
-        if task.state != TaskState::Created && task.state != TaskState::InputRequired {
-            return Ok(JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id: request.id,
-                result: None,
-                error: Some(JsonRpcError {
-                    code: 400,
-                    message: format!(
-                        "Task is in state {:?} and cannot be processed",
-                        task.state
-                    ),
-                    data: None,
-                }),
-            });
-        }
-        
-        // Process the task
-        let updated_task = self.task_manager
-            .process_task(task_id)
-            .await
-            .context("Failed to process task")?;
-        
-        // Return the updated task
-        Ok(JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            id: request.id,
-            result: Some(json!({
-                "task": updated_task,
-            })),
-            error: None,
-        })
-    }
-    
-    /// Handle tasks/sendSubscribe request
-    async fn handle_send_subscribe_task(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
-        // Extract parameters
-        let params = request.params;
-        
-        // Extract task ID
-        let task_id = match params.get("taskId") {
-            Some(Value::String(id_str)) => {
-                Uuid::parse_str(id_str).context("Invalid task ID format")?
-            }
-            _ => {
-                return Ok(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: request.id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32602,
-                        message: "Invalid params: taskId is required and must be a string".to_string(),
-                        data: None,
-                    }),
-                });
-            }
-        };
-        
-        // Check if task exists
-        let task = match self.task_manager.get_task(task_id).await? {
-            Some(task) => task,
-            None => {
-                return Ok(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: request.id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: 404,
-                        message: "Task not found".to_string(),
-                        data: None,
-                    }),
-                });
-            }
-        };
-        
-        // Check if task is in the right state
-        if task.state != TaskState::Created && task.state != TaskState::InputRequired {
-            return Ok(JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                id: request.id,
-                result: None,
-                error: Some(JsonRpcError {
-                    code: 400,
-                    message: format!(
-                        "Task is in state {:?} and cannot be processed",
-                        task.state
-                    ),
-                    data: None,
-                }),
-            });
-        }
-        
-        // Process the task with streaming
-        let event_stream = self.task_manager
-            .process_task_streaming(task_id)
-            .await
-            .context("Failed to process task with streaming")?;
-        
-        // Collect events (in production, these would be streamed via transport)
-        let mut events = Vec::new();
-        tokio::pin!(event_stream);
-        while let Some(event) = event_stream.next().await {
-            events.push(event);
-        }
-        
-        // Return all events (in a real implementation, these would be streamed)
-        Ok(JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            id: request.id,
-            result: Some(json!({
-                "events": events,
-            })),
-            error: None,
-        })
-    }
-    
-    /// Handle tasks/cancel request
-    async fn handle_cancel_task(&self, request: JsonRpcRequest) -> Result<JsonRpcResponse> {
-        // Extract parameters
-        let params = request.params;
-        
-        // Extract task ID
-        let task_id = match params.get("taskId") {
-            Some(Value::String(id_str)) => {
-                Uuid::parse_str(id_str).context("Invalid task ID format")?
-            }
-            _ => {
-                return Ok(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: request.id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32602,
-                        message: "Invalid params: taskId is required and must be a string".to_string(),
-                        data: None,
-                    }),
-                });
-            }
-        };
-        
-        // Try to cancel the task
-        match self.task_manager.cancel_task(task_id).await {
-            Ok(updated_task) => {
-                // Return the updated task
-                Ok(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: request.id,
-                    result: Some(json!({
-                        "task": updated_task,
-                    })),
-                    error: None,
-                })
-            }
-            Err(e) => {
-                // Return error
-                Ok(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: request.id,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: 400,
-                        message: e.to_string(),
-                        data: None,
-                    }),
-                })
-            }
-        }
-    }
-    
-    /// Start the server
-    pub fn start(&self) -> Result<()> {
-        info!("Starting server...");
-        
-        // Start the transport
-        let transport_clone = self.transport.clone();
-        let runtime_handle = self.runtime.handle().clone();
-        
-        runtime_handle.spawn(async move {
-            if let Err(e) = transport_clone.start().await {
-                error!("Failed to start transport: {}", e);
-                return;
-            }
-        });
-        
-        // Run the transport with a request handler
-        let transport = self.transport.clone();
-        let task_manager = self.task_manager.clone();
-        let runtime_handle = self.runtime.handle().clone();
-        
-        // Create a handler that uses the task manager directly
-        let handler = crate::transport::create_handler(move |request| {
-            let tm = task_manager.clone();
-            let method = request.method.clone();
+        // Start the server in the runtime
+        self.runtime.block_on(async {
+            // Start the transport
+            self.transport.start().await?;
             
-            async move {
-                match method.as_str() {
-                    "agents/getInfo" => {
-                        Ok(JsonRpcResponse {
-                            jsonrpc: "2.0".to_string(),
-                            id: request.id,
-                            result: Some(json!({
-                                "agent": tm.agent(),
-                            })),
-                            error: None,
-                        })
-                    }
-                    "tasks/create" => {
-                        // Extract parameters
-                        let params = request.params;
-                        
-                        // Extract messages
-                        let messages = match params.get("messages") {
-                            Some(Value::Array(messages)) => {
-                                let mut result = Vec::new();
-                                for message in messages {
-                                    let message: Message = serde_json::from_value(message.clone())
-                                        .context("Invalid message format")?;
-                                    result.push(message);
+            // Create and register request handler
+            let task_manager = self.task_manager.clone();
+            let handler = create_handler(move |request: JsonRpcRequest| {
+                let task_manager = task_manager.clone();
+                async move {
+                    match request.method.as_str() {
+                        "agents/getInfo" => {
+                            let agent = task_manager.agent();
+                            let response = create_response(
+                                request.id,
+                                json!({
+                                    "agent": agent,
+                                }),
+                            );
+                            Ok(response)
+                        }
+                        "tasks/create" => {
+                            // Extract messages from params
+                            match request.params.get("messages") {
+                                Some(messages_value) => {
+                                    // Parse messages
+                                    let messages = match serde_json::from_value(messages_value.clone()) {
+                                        Ok(m) => m,
+                                        Err(e) => {
+                                            return Ok(create_error_response(
+                                                request.id,
+                                                -32602,
+                                                format!("Invalid messages parameter: {}", e),
+                                                None,
+                                            ));
+                                        }
+                                    };
+                                    
+                                    // Extract push notification config if present
+                                    let push_notification_config = request
+                                        .params
+                                        .get("pushNotificationConfig")
+                                        .and_then(|v| serde_json::from_value(v.clone()).ok());
+                                    
+                                    // Create task
+                                    match task_manager.create_task(messages, push_notification_config).await {
+                                        Ok(task) => {
+                                            let response = create_response(
+                                                request.id,
+                                                json!({
+                                                    "task": task,
+                                                }),
+                                            );
+                                            Ok(response)
+                                        }
+                                        Err(e) => {
+                                            Ok(create_error_response(
+                                                request.id,
+                                                -32603,
+                                                format!("Failed to create task: {}", e),
+                                                None,
+                                            ))
+                                        }
+                                    }
                                 }
-                                result
-                            }
-                            _ => {
-                                return Ok(JsonRpcResponse {
-                                    jsonrpc: "2.0".to_string(),
-                                    id: request.id,
-                                    result: None,
-                                    error: Some(JsonRpcError {
-                                        code: -32602,
-                                        message: "Invalid params: messages is required and must be an array".to_string(),
-                                        data: None,
-                                    }),
-                                });
-                            }
-                        };
-                        
-                        // Extract push notification config (optional)
-                        let push_notification_config = match params.get("pushNotificationConfig") {
-                            Some(config) => {
-                                let config: PushNotificationConfig = serde_json::from_value(config.clone())
-                                    .context("Invalid pushNotificationConfig format")?;
-                                Some(config)
-                            }
-                            None => None,
-                        };
-                        
-                        // Create the task
-                        let task = tm
-                            .create_task(messages, push_notification_config)
-                            .await
-                            .context("Failed to create task")?;
-                        
-                        // Return the task
-                        Ok(JsonRpcResponse {
-                            jsonrpc: "2.0".to_string(),
-                            id: request.id,
-                            result: Some(json!({
-                                "task": task,
-                            })),
-                            error: None,
-                        })
-                    }
-                    "tasks/get" => {
-                        // Extract parameters
-                        let params = request.params;
-                        
-                        // Extract task ID
-                        let task_id = match params.get("taskId") {
-                            Some(Value::String(id_str)) => {
-                                Uuid::parse_str(id_str).context("Invalid task ID format")?
-                            }
-                            _ => {
-                                return Ok(JsonRpcResponse {
-                                    jsonrpc: "2.0".to_string(),
-                                    id: request.id,
-                                    result: None,
-                                    error: Some(JsonRpcError {
-                                        code: -32602,
-                                        message: "Invalid params: taskId is required and must be a string".to_string(),
-                                        data: None,
-                                    }),
-                                });
-                            }
-                        };
-                        
-                        // Get the task
-                        let task = match tm.get_task(task_id).await? {
-                            Some(task) => task,
-                            None => {
-                                return Ok(JsonRpcResponse {
-                                    jsonrpc: "2.0".to_string(),
-                                    id: request.id,
-                                    result: None,
-                                    error: Some(JsonRpcError {
-                                        code: 404,
-                                        message: "Task not found".to_string(),
-                                        data: None,
-                                    }),
-                                });
-                            }
-                        };
-                        
-                        // Return the task
-                        Ok(JsonRpcResponse {
-                            jsonrpc: "2.0".to_string(),
-                            id: request.id,
-                            result: Some(json!({
-                                "task": task,
-                            })),
-                            error: None,
-                        })
-                    }
-                    "tasks/send" => {
-                        // Extract parameters
-                        let params = request.params;
-                        
-                        // Extract task ID
-                        let task_id = match params.get("taskId") {
-                            Some(Value::String(id_str)) => {
-                                Uuid::parse_str(id_str).context("Invalid task ID format")?
-                            }
-                            _ => {
-                                return Ok(JsonRpcResponse {
-                                    jsonrpc: "2.0".to_string(),
-                                    id: request.id,
-                                    result: None,
-                                    error: Some(JsonRpcError {
-                                        code: -32602,
-                                        message: "Invalid params: taskId is required and must be a string".to_string(),
-                                        data: None,
-                                    }),
-                                });
-                            }
-                        };
-                        
-                        // Check if task exists
-                        let task = match tm.get_task(task_id).await? {
-                            Some(task) => task,
-                            None => {
-                                return Ok(JsonRpcResponse {
-                                    jsonrpc: "2.0".to_string(),
-                                    id: request.id,
-                                    result: None,
-                                    error: Some(JsonRpcError {
-                                        code: 404,
-                                        message: "Task not found".to_string(),
-                                        data: None,
-                                    }),
-                                });
-                            }
-                        };
-                        
-                        // Check if task is in the right state
-                        if task.state != TaskState::Created && task.state != TaskState::InputRequired {
-                            return Ok(JsonRpcResponse {
-                                jsonrpc: "2.0".to_string(),
-                                id: request.id,
-                                result: None,
-                                error: Some(JsonRpcError {
-                                    code: 400,
-                                    message: format!(
-                                        "Task is in state {:?} and cannot be processed",
-                                        task.state
-                                    ),
-                                    data: None,
-                                }),
-                            });
-                        }
-                        
-                        // Process the task
-                        let updated_task = tm
-                            .process_task(task_id)
-                            .await
-                            .context("Failed to process task")?;
-                        
-                        // Return the updated task
-                        Ok(JsonRpcResponse {
-                            jsonrpc: "2.0".to_string(),
-                            id: request.id,
-                            result: Some(json!({
-                                "task": updated_task,
-                            })),
-                            error: None,
-                        })
-                    }
-                    "tasks/sendSubscribe" => {
-                        // Extract parameters
-                        let params = request.params;
-                        
-                        // Extract task ID
-                        let task_id = match params.get("taskId") {
-                            Some(Value::String(id_str)) => {
-                                Uuid::parse_str(id_str).context("Invalid task ID format")?
-                            }
-                            _ => {
-                                return Ok(JsonRpcResponse {
-                                    jsonrpc: "2.0".to_string(),
-                                    id: request.id,
-                                    result: None,
-                                    error: Some(JsonRpcError {
-                                        code: -32602,
-                                        message: "Invalid params: taskId is required and must be a string".to_string(),
-                                        data: None,
-                                    }),
-                                });
-                            }
-                        };
-                        
-                        // Check if task exists
-                        let task = match tm.get_task(task_id).await? {
-                            Some(task) => task,
-                            None => {
-                                return Ok(JsonRpcResponse {
-                                    jsonrpc: "2.0".to_string(),
-                                    id: request.id,
-                                    result: None,
-                                    error: Some(JsonRpcError {
-                                        code: 404,
-                                        message: "Task not found".to_string(),
-                                        data: None,
-                                    }),
-                                });
-                            }
-                        };
-                        
-                        // Check if task is in the right state
-                        if task.state != TaskState::Created && task.state != TaskState::InputRequired {
-                            return Ok(JsonRpcResponse {
-                                jsonrpc: "2.0".to_string(),
-                                id: request.id,
-                                result: None,
-                                error: Some(JsonRpcError {
-                                    code: 400,
-                                    message: format!(
-                                        "Task is in state {:?} and cannot be processed",
-                                        task.state
-                                    ),
-                                    data: None,
-                                }),
-                            });
-                        }
-                        
-                        // Process the task with streaming
-                        let event_stream = tm
-                            .process_task_streaming(task_id)
-                            .await
-                            .context("Failed to process task with streaming")?;
-                        
-                        // Collect events (in production, these would be streamed via transport)
-                        let mut events = Vec::new();
-                        tokio::pin!(event_stream);
-                        while let Some(event) = event_stream.next().await {
-                            events.push(event);
-                        }
-                        
-                        // Return all events (in a real implementation, these would be streamed)
-                        Ok(JsonRpcResponse {
-                            jsonrpc: "2.0".to_string(),
-                            id: request.id,
-                            result: Some(json!({
-                                "events": events,
-                            })),
-                            error: None,
-                        })
-                    }
-                    "tasks/cancel" => {
-                        // Extract parameters
-                        let params = request.params;
-                        
-                        // Extract task ID
-                        let task_id = match params.get("taskId") {
-                            Some(Value::String(id_str)) => {
-                                Uuid::parse_str(id_str).context("Invalid task ID format")?
-                            }
-                            _ => {
-                                return Ok(JsonRpcResponse {
-                                    jsonrpc: "2.0".to_string(),
-                                    id: request.id,
-                                    result: None,
-                                    error: Some(JsonRpcError {
-                                        code: -32602,
-                                        message: "Invalid params: taskId is required and must be a string".to_string(),
-                                        data: None,
-                                    }),
-                                });
-                            }
-                        };
-                        
-                        // Try to cancel the task
-                        match tm.cancel_task(task_id).await {
-                            Ok(updated_task) => {
-                                // Return the updated task
-                                Ok(JsonRpcResponse {
-                                    jsonrpc: "2.0".to_string(),
-                                    id: request.id,
-                                    result: Some(json!({
-                                        "task": updated_task,
-                                    })),
-                                    error: None,
-                                })
-                            }
-                            Err(e) => {
-                                // Return error
-                                Ok(JsonRpcResponse {
-                                    jsonrpc: "2.0".to_string(),
-                                    id: request.id,
-                                    result: None,
-                                    error: Some(JsonRpcError {
-                                        code: 400,
-                                        message: e.to_string(),
-                                        data: None,
-                                    }),
-                                })
+                                None => {
+                                    Ok(create_error_response(
+                                        request.id,
+                                        -32602,
+                                        "Missing messages parameter".to_string(),
+                                        None,
+                                    ))
+                                }
                             }
                         }
+                        "tasks/get" => {
+                            // Extract task ID from params
+                            match request.params.get("taskId") {
+                                Some(task_id_value) => {
+                                    // Parse task ID
+                                    let task_id_str = match task_id_value.as_str() {
+                                        Some(s) => s,
+                                        None => {
+                                            return Ok(create_error_response(
+                                                request.id,
+                                                -32602,
+                                                "Invalid taskId parameter, must be a string".to_string(),
+                                                None,
+                                            ));
+                                        }
+                                    };
+                                    
+                                    // Parse UUID
+                                    let task_id = match Uuid::parse_str(task_id_str) {
+                                        Ok(id) => id,
+                                        Err(e) => {
+                                            return Ok(create_error_response(
+                                                request.id,
+                                                -32602,
+                                                format!("Invalid UUID format: {}", e),
+                                                None,
+                                            ));
+                                        }
+                                    };
+                                    
+                                    // Get task
+                                    match task_manager.get_task(task_id).await {
+                                        Ok(Some(task)) => {
+                                            let response = create_response(
+                                                request.id,
+                                                json!({
+                                                    "task": task,
+                                                }),
+                                            );
+                                            Ok(response)
+                                        }
+                                        Ok(None) => {
+                                            Ok(create_error_response(
+                                                request.id,
+                                                -32001,
+                                                format!("Task not found: {}", task_id),
+                                                None,
+                                            ))
+                                        }
+                                        Err(e) => {
+                                            Ok(create_error_response(
+                                                request.id,
+                                                -32603,
+                                                format!("Failed to get task: {}", e),
+                                                None,
+                                            ))
+                                        }
+                                    }
+                                }
+                                None => {
+                                    Ok(create_error_response(
+                                        request.id,
+                                        -32602,
+                                        "Missing taskId parameter".to_string(),
+                                        None,
+                                    ))
+                                }
+                            }
+                        }
+                        "tasks/send" => {
+                            // Extract task ID from params
+                            match request.params.get("taskId") {
+                                Some(task_id_value) => {
+                                    // Parse task ID
+                                    let task_id_str = match task_id_value.as_str() {
+                                        Some(s) => s,
+                                        None => {
+                                            return Ok(create_error_response(
+                                                request.id,
+                                                -32602,
+                                                "Invalid taskId parameter, must be a string".to_string(),
+                                                None,
+                                            ));
+                                        }
+                                    };
+                                    
+                                    // Parse UUID
+                                    let task_id = match Uuid::parse_str(task_id_str) {
+                                        Ok(id) => id,
+                                        Err(e) => {
+                                            return Ok(create_error_response(
+                                                request.id,
+                                                -32602,
+                                                format!("Invalid UUID format: {}", e),
+                                                None,
+                                            ));
+                                        }
+                                    };
+                                    
+                                    // Process task
+                                    match task_manager.process_task(task_id).await {
+                                        Ok(task) => {
+                                            let response = create_response(
+                                                request.id,
+                                                json!({
+                                                    "task": task,
+                                                }),
+                                            );
+                                            Ok(response)
+                                        }
+                                        Err(e) => {
+                                            Ok(create_error_response(
+                                                request.id,
+                                                -32603,
+                                                format!("Failed to process task: {}", e),
+                                                None,
+                                            ))
+                                        }
+                                    }
+                                }
+                                None => {
+                                    Ok(create_error_response(
+                                        request.id,
+                                        -32602,
+                                        "Missing taskId parameter".to_string(),
+                                        None,
+                                    ))
+                                }
+                            }
+                        }
+                        "tasks/sendSubscribe" => {
+                            // Extract task ID from params
+                            match request.params.get("taskId") {
+                                Some(task_id_value) => {
+                                    // Parse task ID
+                                    let task_id_str = match task_id_value.as_str() {
+                                        Some(s) => s,
+                                        None => {
+                                            return Ok(create_error_response(
+                                                request.id,
+                                                -32602,
+                                                "Invalid taskId parameter, must be a string".to_string(),
+                                                None,
+                                            ));
+                                        }
+                                    };
+                                    
+                                    // Parse UUID
+                                    let task_id = match Uuid::parse_str(task_id_str) {
+                                        Ok(id) => id,
+                                        Err(e) => {
+                                            return Ok(create_error_response(
+                                                request.id,
+                                                -32602,
+                                                format!("Invalid UUID format: {}", e),
+                                                None,
+                                            ));
+                                        }
+                                    };
+                                    
+                                    // Process task with streaming
+                                    match task_manager.process_task_streaming(task_id).await {
+                                        Ok(stream) => {
+                                            // Collect all events to return in the response
+                                            // Use StreamExt::collect instead of Iterator::collect
+                                            let events = stream.collect::<Vec<_>>().await;
+                                            
+                                            let response = create_response(
+                                                request.id,
+                                                json!({
+                                                    "events": events,
+                                                }),
+                                            );
+                                            Ok(response)
+                                        }
+                                        Err(e) => {
+                                            Ok(create_error_response(
+                                                request.id,
+                                                -32603,
+                                                format!("Failed to process streaming task: {}", e),
+                                                None,
+                                            ))
+                                        }
+                                    }
+                                }
+                                None => {
+                                    Ok(create_error_response(
+                                        request.id,
+                                        -32602,
+                                        "Missing taskId parameter".to_string(),
+                                        None,
+                                    ))
+                                }
+                            }
+                        }
+                        "tasks/cancel" => {
+                            // Extract task ID from params
+                            match request.params.get("taskId") {
+                                Some(task_id_value) => {
+                                    // Parse task ID
+                                    let task_id_str = match task_id_value.as_str() {
+                                        Some(s) => s,
+                                        None => {
+                                            return Ok(create_error_response(
+                                                request.id,
+                                                -32602,
+                                                "Invalid taskId parameter, must be a string".to_string(),
+                                                None,
+                                            ));
+                                        }
+                                    };
+                                    
+                                    // Parse UUID
+                                    let task_id = match Uuid::parse_str(task_id_str) {
+                                        Ok(id) => id,
+                                        Err(e) => {
+                                            return Ok(create_error_response(
+                                                request.id,
+                                                -32602,
+                                                format!("Invalid UUID format: {}", e),
+                                                None,
+                                            ));
+                                        }
+                                    };
+                                    
+                                    // Cancel task
+                                    match task_manager.cancel_task(task_id).await {
+                                        Ok(task) => {
+                                            let response = create_response(
+                                                request.id,
+                                                json!({
+                                                    "task": task,
+                                                }),
+                                            );
+                                            Ok(response)
+                                        }
+                                        Err(e) => {
+                                            Ok(create_error_response(
+                                                request.id,
+                                                -32603,
+                                                format!("Failed to cancel task: {}", e),
+                                                None,
+                                            ))
+                                        }
+                                    }
+                                }
+                                None => {
+                                    Ok(create_error_response(
+                                        request.id,
+                                        -32602,
+                                        "Missing taskId parameter".to_string(),
+                                        None,
+                                    ))
+                                }
+                            }
+                        }
+                        _ => {
+                            Ok(create_error_response(
+                                request.id,
+                                -32601,
+                                format!("Method not found: {}", request.method),
+                                None,
+                            ))
+                        }
                     }
-                    _ => Ok(JsonRpcResponse {
-                        jsonrpc: "2.0".to_string(),
-                        id: request.id,
-                        result: None,
-                        error: Some(JsonRpcError {
-                            code: -32601,
-                            message: "Method not found".to_string(),
-                            data: None,
-                        }),
-                    }),
+                }
+            });
+            
+            // Clone transport before moving it into the spawned task
+            let transport_clone = self.transport.clone();
+            
+            // Run the transport with the handler
+            let transport_handle = tokio::spawn(async move {
+                if let Err(e) = transport_clone.run(handler).await {
+                    error!("Transport error: {}", e);
+                }
+            });
+            
+            // Wait for shutdown signal
+            tokio::select! {
+                _ = signal::ctrl_c() => {
+                    info!("Received Ctrl+C, shutting down...");
+                }
+                _ = rx => {
+                    info!("Received shutdown signal, shutting down...");
                 }
             }
-        });
-        
-        // Run the transport with the handler
-        runtime_handle.spawn(async move {
-            if let Err(e) = transport.run(handler).await {
-                error!("Failed to run transport: {}", e);
+            
+            // Abort the transport handler
+            transport_handle.abort();
+            
+            // Stop the transport
+            if let Err(e) = self.transport.stop().await {
+                error!("Error stopping transport: {}", e);
             }
-        });
+            
+            info!("Server shutdown complete");
+            
+            Ok::<_, anyhow::Error>(())
+        })?;
         
-        info!("Server started");
         Ok(())
     }
     
-    /// Run the server until shutdown signal
-    pub fn run_until_shutdown(&self) -> Result<()> {
-        self.start()?;
-        
-        self.runtime.block_on(async {
-            // Wait for Ctrl+C
-            if let Err(e) = ctrl_c().await {
-                error!("Failed to listen for Ctrl+C: {}", e);
-                return;
-            }
-            
-            info!("Received shutdown signal, stopping server...");
-            if let Err(e) = self.transport.stop().await {
-                error!("Failed to stop transport: {}", e);
-            }
-            
-            info!("Server stopped");
-        });
-        
+    /// Request server shutdown
+    pub fn shutdown(&self) -> Result<()> {
+        // Currently not implemented - would send a signal to the shutdown channel
         Ok(())
     }
 }
-

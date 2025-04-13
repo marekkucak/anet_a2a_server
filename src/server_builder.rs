@@ -1,15 +1,19 @@
+// src/server_builder.rs
+
 use std::sync::Arc;
 use anyhow::Result;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
 use crate::task_manager::TaskManager;
+use crate::task_manager_trait::TaskManagerTrait; // Add this import
 use crate::server::Server;
 use crate::transport::TransportFactory;
 use crate::types::AgentCard;
 
 /// Builder for Server
 pub struct ServerBuilder {
+    task_manager: Option<Arc<dyn TaskManagerTrait>>, // Changed from Option<Arc<TaskManager>>
     agent_id: Option<Uuid>,
     agent_name: Option<String>,
     agent_description: Option<String>,
@@ -27,12 +31,22 @@ impl ServerBuilder {
     /// Create a new ServerBuilder
     pub fn new() -> Self {
         Self {
+            task_manager: None,
             agent_id: None,
             agent_name: None,
             agent_description: None,
             transport_factory: None,
             runtime: None,
         }
+    }
+    
+    /// Set a custom task manager (like RedisTaskManager)
+    pub fn with_task_manager<T>(mut self, task_manager: T) -> Self 
+    where 
+        T: TaskManagerTrait + 'static 
+    {
+        self.task_manager = Some(Arc::new(task_manager));
+        self
     }
     
     /// Set the agent ID
@@ -67,17 +81,6 @@ impl ServerBuilder {
     
     /// Build the server
     pub fn build(self) -> Result<Server> {
-        // Extract or generate agent ID
-        let agent_id = self.agent_id.unwrap_or_else(Uuid::new_v4);
-        
-        // Extract or default agent name
-        let agent_name = self.agent_name.unwrap_or_else(|| "A2A Agent".to_string());
-        
-        // Extract or default agent description
-        let agent_description = self.agent_description.unwrap_or_else(|| {
-            "A generic A2A agent implementation".to_string()
-        });
-        
         // Extract transport factory or error
         let transport_factory = self
             .transport_factory
@@ -88,17 +91,33 @@ impl ServerBuilder {
             Runtime::new().expect("Failed to create Tokio runtime")
         });
         
-        // Create agent card
-        let agent = AgentCard {
-            id: agent_id,
-            name: agent_name,
-            description: agent_description,
-            metadata: None,
-            version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        // Use provided task manager or create a default one
+        let task_manager = if let Some(tm) = self.task_manager {
+            tm
+        } else {
+            // Extract or generate agent ID
+            let agent_id = self.agent_id.unwrap_or_else(Uuid::new_v4);
+            
+            // Extract or default agent name
+            let agent_name = self.agent_name.unwrap_or_else(|| "A2A Agent".to_string());
+            
+            // Extract or default agent description
+            let agent_description = self.agent_description.unwrap_or_else(|| {
+                "A generic A2A agent implementation".to_string()
+            });
+            
+            // Create agent card
+            let agent = AgentCard {
+                id: agent_id,
+                name: agent_name,
+                description: agent_description,
+                metadata: None,
+                version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            };
+            
+            // Create default task manager
+            Arc::new(TaskManager::new(agent))
         };
-        
-        // Create task manager
-        let task_manager = Arc::new(TaskManager::new(agent));
         
         // Create transport
         let transport = transport_factory.create()?;
